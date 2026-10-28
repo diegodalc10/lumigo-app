@@ -68,8 +68,7 @@ def need(cond,msg,code=400):
 
 class Handler(BaseHTTPRequestHandler):
  def authorized_demo(self):
-  # HTTPS-enabled private test deployment. Browser's Basic Auth challenge
-  # blocks all application routes before demo accounts are accessible.
+  # The mobile-friendly access form and legacy Basic Auth issue the same private cookie.
   if urlparse(self.path).path == '/api/health': return True
   cookie_name='lumigo_demo_gate'
   cookie=self.headers.get('Cookie','')
@@ -86,7 +85,21 @@ class Handler(BaseHTTPRequestHandler):
    if valid: self._issue_demo_cookie=expected
    return valid
   except (ValueError,UnicodeError): return False
+ def gate_page(self,error=False):
+  page=(ROOT/'public/private-access.html').read_text().replace('{{ERROR}}','Usuario o clave de acceso incorrectos. Inténtalo de nuevo.' if error else '')
+  return self.send(page.encode(),401 if error else 200,'text/html; charset=utf-8')
+ def gate_login(self):
+  n=int(self.headers.get('Content-Length','0')); need(0<n<=4096,'Solicitud inválida')
+  fields=parse_qs(self.rfile.read(n).decode('utf-8'),max_num_fields=4)
+  username=fields.get('username',[''])[0]; password=fields.get('password',[''])[0]
+  valid=hmac.compare_digest(username.encode(),GATE_USER.encode()) and hmac.compare_digest(password.encode(),GATE_PASSWORD.encode())
+  if not valid: return self.gate_page(error=True)
+  cookie=hmac.new(GATE_PASSWORD.encode(),b'lumigo-private-gate-v1',hashlib.sha256).hexdigest()
+  self.send_response(303)
+  self.send_header('Set-Cookie','lumigo_demo_gate='+cookie+'; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=28800')
+  self.send_header('Location','/'); self.send_header('Cache-Control','no-store'); self.send_header('Content-Length','0'); self.end_headers()
  def deny_gate(self):
+  if self.command=='GET' and urlparse(self.path).path in ('/','/index.html','/private-access'): return self.gate_page()
   self.send_response(401)
   self.send_header('WWW-Authenticate','Basic realm="LumiGo demo privado", charset="UTF-8"')
   self.send_header('Cache-Control','no-store')
@@ -122,6 +135,7 @@ class Handler(BaseHTTPRequestHandler):
   if not self.authorized_demo(): return self.deny_gate()
   self.response(self.get)
  def do_POST(self):
+  if urlparse(self.path).path=='/private-access': return self.response(self.gate_login)
   if not self.authorized_demo(): return self.deny_gate()
   self.response(self.post)
  def get(self):

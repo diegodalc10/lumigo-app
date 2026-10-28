@@ -66,6 +66,29 @@ class StaffFeatures(unittest.TestCase):
         os.environ.update(cls.saved_env)
         cls.temp.cleanup()
 
+    def test_mobile_private_access_form(self):
+        import http.client
+        from urllib.parse import urlencode
+        status,headers,page=self.request('/')
+        self.assertEqual(status,200)
+        self.assertNotIn('WWW-Authenticate',headers)
+        self.assertIn(b'action="/private-access"',page)
+        self.assertEqual(self.request('/api/products')[0],401)
+        conn=http.client.HTTPConnection('127.0.0.1',self.server.server_port)
+        for password,expected in [('wrong',401),(os.environ['LUMIGO_GATE_PASSWORD'],303)]:
+            body=urlencode({'username':'test','password':password})
+            conn.request('POST','/private-access',body,{'Content-Type':'application/x-www-form-urlencoded'})
+            r=conn.getresponse();content=r.read()
+            self.assertEqual(r.status,expected)
+            self.assertIsNone(r.getheader('WWW-Authenticate'))
+            self.assertNotIn(password.encode(),content)
+            if expected==303:
+                cookie=r.getheader('Set-Cookie')
+                self.assertIn('Secure; HttpOnly; SameSite=Lax',cookie)
+                self.assertEqual(r.getheader('Location'),'/')
+                self.assertEqual(self.request('/',headers={'Cookie':cookie.split(';')[0]})[0],200)
+        conn.close()
+
     def test_reports_preserve_purchase_name_price_and_reset_only_view(self):
         product=self.request('/api/manage-products',headers=self.sessions['MERCHANT'])[2]['items'][0]
         purchase=self.request('/api/buy',{'product_id':product['id']},self.sessions['USER'])
