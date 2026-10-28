@@ -4,11 +4,14 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from dashboard import build_dashboard
 from media import prepare_image, image_url
+from records import view_cutoff, transaction_records, export_products, backup_bytes
+from storage import database_path, validate_storage
+from excel_export import report_workbook
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs
 
 ROOT=Path(__file__).resolve().parent
-DB=Path(os.environ.get('LUMIGO_DB',str(ROOT/'lumigo.sqlite3')))
+DB=database_path(ROOT)
 LOCK=threading.RLock()
 PORT=int(os.environ.get('PORT','8080'))
 HOST=os.environ.get('HOST','127.0.0.1')
@@ -41,11 +44,18 @@ def init():
   CREATE TABLE IF NOT EXISTS admin_recharges(id INTEGER PRIMARY KEY,request_id TEXT UNIQUE NOT NULL,account_id INTEGER NOT NULL REFERENCES accounts(id),actor_id INTEGER NOT NULL REFERENCES accounts(id),amount INTEGER NOT NULL CHECK(amount>0),note TEXT NOT NULL,reference TEXT UNIQUE NOT NULL,created INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS media(id TEXT PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN ('avatar','product','store')),target_id INTEGER NOT NULL,owner_id INTEGER NOT NULL REFERENCES accounts(id),data BLOB NOT NULL,created INTEGER NOT NULL);
   CREATE UNIQUE INDEX IF NOT EXISTS media_single ON media(kind,target_id) WHERE kind IN ('avatar','product');
-  CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY,account_id INTEGER NOT NULL,store_id INTEGER NOT NULL,product_id INTEGER NOT NULL,amount INTEGER NOT NULL,created INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS report_markers(account_id INTEGER PRIMARY KEY REFERENCES accounts(id),cutoff REAL NOT NULL);
+  CREATE TABLE IF NOT EXISTS reset_audit(id INTEGER PRIMARY KEY,actor_id INTEGER NOT NULL REFERENCES accounts(id),target_id INTEGER NOT NULL REFERENCES accounts(id),created REAL NOT NULL,request_id TEXT UNIQUE NOT NULL);
+  CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY,account_id INTEGER NOT NULL,store_id INTEGER NOT NULL,product_id INTEGER NOT NULL,amount INTEGER NOT NULL,created INTEGER NOT NULL,product_name TEXT,store_name TEXT,reference TEXT);
   ''')
+  columns={r['name'] for r in c.execute('PRAGMA table_info(purchases)')}
+  for name in ('product_name','store_name','reference'):
+   if name not in columns: c.execute('ALTER TABLE purchases ADD COLUMN '+name+' TEXT')
+  c.execute('UPDATE purchases SET product_name=(SELECT name FROM products WHERE id=purchases.product_id) WHERE product_name IS NULL')
+  c.execute('UPDATE purchases SET store_name=(SELECT name FROM stores WHERE id=purchases.store_id) WHERE store_name IS NULL')
   if not c.execute('SELECT 1 FROM accounts LIMIT 1').fetchone():
    demo=[('Valentina Gómez','usuario@lumigo.demo',os.environ.get('LUMIGO_USER_PASSWORD') or secrets.token_urlsafe(32),'user',45000),('Carlos Rojas','carlos@lumigo.demo',os.environ.get('LUMIGO_USER_PASSWORD') or secrets.token_urlsafe(32),'user',12500),('Comercio Café Andino','comercio@lumigo.demo',os.environ.get('LUMIGO_MERCHANT_PASSWORD') or secrets.token_urlsafe(32),'merchant',0),('LumiGo Operador','operador@lumigo.demo',os.environ.get('LUMIGO_OPERATOR_PASSWORD') or secrets.token_urlsafe(32),'operator',0),('LumiGo Administrador','admin@lumigo.demo',os.environ.get('LUMIGO_ADMIN_PASSWORD') or secrets.token_urlsafe(32),'admin',0)]
-   for name,email,password,role,points in demo: c.execute('INSERT INTO accounts(name,email,passhash,role,points,created) VALUES(?,?,?,?,?,?)',(name,email,pwd(password),role,points,int(time.time())))
+   for name,email,password,role,points in demo: c.execute('INSERT INTO accounts(name,email,passhash,role,points,created) VALUES(?,?,?,?,?,?)',(name,email,pwd(password),role,points,time.time()))
    owner=c.execute("SELECT id FROM accounts WHERE email='comercio@lumigo.demo'").fetchone()[0]
    c.execute('INSERT INTO stores(name,owner) VALUES(?,?)',('Café Andino',owner)); sid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
    for p in [('Capuchino',9500,30,'☕'),('Desayuno especial',18000,15,'🥐'),('Cuaderno premium',12000,10,'📘')]: c.execute('INSERT INTO products(store_id,name,price,stock,icon) VALUES(?,?,?,?,?)',(sid,*p))
@@ -88,6 +98,7 @@ class Handler(BaseHTTPRequestHandler):
   self.send_response(status)
   if getattr(self,'_issue_demo_cookie',None): self.send_header('Set-Cookie','lumigo_demo_gate='+self._issue_demo_cookie+'; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=28800')
   if hasattr(self,'_session_cookie'): self.send_header('Set-Cookie','lumigo_session='+self._session_cookie+'; Path=/api/media/; Secure; HttpOnly; SameSite=Strict; Max-Age='+('86400' if self._session_cookie else '0'))
+  if hasattr(self,'_download_name'): self.send_header('Content-Disposition','attachment; filename="'+self._download_name+'"')
   self.send_header('Content-Type',ctype); self.send_header('Content-Length',str(len(data))); self.send_header('Cache-Control','no-store'); self.send_header('X-Content-Type-Options','nosniff'); self.send_header('X-Frame-Options','DENY'); self.end_headers(); self.wfile.write(data)
  def body(self):
   n=int(self.headers.get('Content-Length','0')); limit=7*1024*1024 if urlparse(self.path).path=='/api/media-upload' else 20000; need(0<n<=limit,'Solicitud inválida o imagen demasiado grande')
@@ -101,7 +112,7 @@ class Handler(BaseHTTPRequestHandler):
     if name=='lumigo_session': auth='Bearer '+value
   need(auth.startswith('Bearer '),'Inicia sesión',401)
   key=hashlib.sha256(auth[7:].encode()).hexdigest()
-  row=c.execute('SELECT a.* FROM sessions s JOIN accounts a ON a.id=s.user_id WHERE s.tokenhash=? AND s.expires>?',(key,int(time.time()))).fetchone()
+  row=c.execute('SELECT a.* FROM sessions s JOIN accounts a ON a.id=s.user_id WHERE s.tokenhash=? AND s.expires>?',(key,time.time())).fetchone()
   need(row is not None,'Sesión caducada',401); return row
  def response(self,fn):
   try: fn()
@@ -116,7 +127,7 @@ class Handler(BaseHTTPRequestHandler):
  def get(self):
   route=urlparse(self.path).path
   if route=='/' or route=='/index.html': return self.send((ROOT/'public/index.html').read_bytes(),200,'text/html; charset=utf-8')
-  if route in ('/dashboard.js','/dashboard.css','/media-ui.js','/media-ui.css'):
+  if route in ('/dashboard.js','/dashboard.css','/media-ui.js','/media-ui.css','/reports-ui.js'):
    return self.send((ROOT/'public'/route[1:]).read_bytes(),200,'text/javascript; charset=utf-8' if route.endswith('.js') else 'text/css; charset=utf-8')
   if route=='/manifest.json': return self.send((ROOT/'public/manifest.json').read_bytes(),200,'application/manifest+json')
   if route=='/api/health': return self.send({'ok':True,'mode':'DEMO','payments_real':False})
@@ -163,7 +174,9 @@ class Handler(BaseHTTPRequestHandler):
     items=[dict(x) for x in c.execute('SELECT id,name,active FROM stores ORDER BY id')]
     for item in items: item['images']=[{'id':x['id'],'url':'/api/media/'+x['id']} for x in c.execute("SELECT id FROM media WHERE kind='store' AND target_id=? ORDER BY created,id",(item['id'],))]
     return self.send({'items':items})
-   if route=='/api/movements': return self.send({'items':[dict(x) for x in c.execute('SELECT id,delta,kind,reference,created FROM movements WHERE account_id=? ORDER BY id DESC LIMIT 100',(u['id'],))]})
+   if route=='/api/movements':
+    cutoff=0 if parse_qs(urlparse(self.path).query).get('all')==['1'] else view_cutoff(c,u)
+    return self.send({'items':[dict(x) for x in c.execute('SELECT id,delta,kind,reference,created FROM movements WHERE account_id=? AND created>=? ORDER BY id DESC LIMIT 100',(u['id'],cutoff))]})
    if route=='/api/charges':
     if u['role']=='merchant': rows=c.execute('SELECT q.*,s.name store_name,a.name payer_name FROM charges q JOIN stores s ON s.id=q.store_id LEFT JOIN accounts a ON a.id=q.payer WHERE s.owner=? ORDER BY q.id DESC',(u['id'],))
     elif u['role'] in ('operator','admin'): rows=c.execute('SELECT q.*,s.name store_name,a.name payer_name FROM charges q JOIN stores s ON s.id=q.store_id LEFT JOIN accounts a ON a.id=q.payer ORDER BY q.id DESC LIMIT 100')
@@ -178,6 +191,21 @@ class Handler(BaseHTTPRequestHandler):
    if route=='/api/admin-recharges':
     need(u['role']=='admin','Solo administrador',403)
     return self.send({'items':[dict(x) for x in c.execute('SELECT r.reference,r.amount,r.note,r.created,a.name,a.email,actor.name AS actor_name FROM admin_recharges r JOIN accounts a ON a.id=r.account_id JOIN accounts actor ON actor.id=r.actor_id ORDER BY r.id DESC LIMIT 100')]})
+   if route=='/api/records':
+    complete=parse_qs(urlparse(self.path).query).get('all')==['1']
+    return self.send({'items':transaction_records(c,u,complete),'cutoff':view_cutoff(c,u)})
+   if route=='/api/report-targets':
+    need(u['role']=='admin','Solo administrador',403)
+    return self.send({'items':[dict(r) for r in c.execute("SELECT id,name,email,role FROM accounts WHERE role IN ('user','merchant') ORDER BY role,name")]})
+   if route=='/api/export.xlsx':
+    days=int(parse_qs(urlparse(self.path).query).get('days',['30'])[0]);need(days in (7,30,90),'Período inválido')
+    data=report_workbook(build_dashboard(c,u,days),transaction_records(c,u,True),export_products(c,u))
+    self._download_name='LumiGo-'+u['role']+'.xlsx'
+    return self.send(data,200,'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
+   if route=='/api/backup':
+    need(u['role']=='admin','Solo administrador',403)
+    self._download_name='LumiGo-respaldo-privado.sqlite3'
+    return self.send(backup_bytes(c),200,'application/octet-stream')
    if route=='/api/dashboard':
     days=int(parse_qs(urlparse(self.path).query).get('days',['30'])[0])
     need(days in (7,30,90),'Período inválido: selecciona 7, 30 o 90 días')
@@ -191,7 +219,7 @@ class Handler(BaseHTTPRequestHandler):
    with LOCK,connect() as c:
     u=c.execute('SELECT * FROM accounts WHERE email=?',(email,)).fetchone()
     need(u is not None and verify(password,u['passhash']),'Credenciales incorrectas',401)
-    token=secrets.token_urlsafe(40); c.execute('INSERT INTO sessions VALUES(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),u['id'],int(time.time())+86400))
+    token=secrets.token_urlsafe(40); c.execute('INSERT INTO sessions VALUES(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),u['id'],time.time()+86400))
    self._session_cookie=token
    return self.send({'token':token})
   if route=='/api/register':
@@ -199,8 +227,8 @@ class Handler(BaseHTTPRequestHandler):
    need(2<=len(name)<=80 and '@' in email and len(email)<150 and len(password)>=10,'Revisa nombre, correo o contraseña (mínimo 10 caracteres)')
    with LOCK,connect() as c:
     need(not c.execute('SELECT 1 FROM accounts WHERE email=?',(email,)).fetchone(),'Correo ya registrado',409)
-    c.execute('INSERT INTO accounts(name,email,passhash,role,points,created) VALUES(?,?,?,?,0,?)',(name,email,pwd(password),'user',int(time.time())))
-   return self.send({'ok':True})
+    c.execute('INSERT INTO accounts(name,email,passhash,role,points,created) VALUES(?,?,?,?,0,?)',(name,email,pwd(password),'user',time.time()))
+   c.commit(); return self.send({'ok':True})
   with LOCK,connect() as c:
    c.execute('BEGIN IMMEDIATE')
    u=self.current(c)
@@ -214,7 +242,7 @@ class Handler(BaseHTTPRequestHandler):
     need(12<=len(password)<=256,'Contraseña entre 12 y 256 caracteres')
     need(b.get('role','user')=='user','Solo se pueden crear cuentas de usuario',403)
     need(not c.execute('SELECT 1 FROM accounts WHERE email=?',(email,)).fetchone(),'Correo ya registrado',409)
-    uid=c.execute('INSERT INTO accounts(name,email,passhash,role,points,created) VALUES(?,?,?,?,0,?)',(name,email,pwd(password),'user',int(time.time()))).lastrowid
+    uid=c.execute('INSERT INTO accounts(name,email,passhash,role,points,created) VALUES(?,?,?,?,0,?)',(name,email,pwd(password),'user',time.time())).lastrowid
     c.commit()
     return self.send({'ok':True,'user':{'id':uid,'name':name,'email':email,'role':'user','points':0}},201)
    if route=='/api/admin-events':
@@ -225,7 +253,7 @@ class Handler(BaseHTTPRequestHandler):
     need(2<=len(name)<=100 and 2<=len(location)<=150 and len(description)<=1000,'Revisa nombre, lugar y descripción')
     try: event_date=datetime.strptime(starts_at,'%Y-%m-%dT%H:%M').replace(tzinfo=timezone(timedelta(hours=-5)))
     except ValueError: raise APIError('Fecha y hora inválidas; usa la hora de Bogotá')
-    eid=c.execute('INSERT INTO events(name,starts_at,location,description,created_by,created) VALUES(?,?,?,?,?,?)',(name,event_date.isoformat(),location,description,u['id'],int(time.time()))).lastrowid
+    eid=c.execute('INSERT INTO events(name,starts_at,location,description,created_by,created) VALUES(?,?,?,?,?,?)',(name,event_date.isoformat(),location,description,u['id'],time.time())).lastrowid
     c.commit()
     return self.send({'ok':True,'id':eid},201)
    if route=='/api/admin-recharges':
@@ -238,9 +266,9 @@ class Handler(BaseHTTPRequestHandler):
     existing=c.execute('SELECT * FROM admin_recharges WHERE request_id=?',(request_id,)).fetchone()
     if existing:
      need(existing['actor_id']==u['id'] and existing['account_id']==account_id and existing['amount']==amount and existing['note']==note,'La operación ya existe con otros datos; actualiza la página',409)
-     return self.send({'ok':True,'ref':existing['reference'],'replayed':True,'message':'Esta recarga simulada ya fue registrada; no se duplicó'})
+     c.commit(); return self.send({'ok':True,'ref':existing['reference'],'replayed':True,'message':'Esta recarga simulada ya fue registrada; no se duplicó'})
     need(c.execute("SELECT 1 FROM accounts WHERE id=? AND role='user'",(account_id,)).fetchone() is not None,'Usuario no encontrado',404)
-    ref='DEMO-ADMIN-'+secrets.token_hex(8).upper(); now=int(time.time())
+    ref='DEMO-ADMIN-'+secrets.token_hex(8).upper(); now=time.time()
     c.execute('UPDATE accounts SET points=points+? WHERE id=?',(amount,account_id))
     c.execute('INSERT INTO movements(account_id,delta,kind,reference,created) VALUES(?,?,?,?,?)',(account_id,amount,'recarga-demo',ref,now))
     c.execute('INSERT INTO admin_recharges(request_id,account_id,actor_id,amount,note,reference,created) VALUES(?,?,?,?,?,?,?)',(request_id,account_id,u['id'],amount,note,ref,now))
@@ -248,21 +276,21 @@ class Handler(BaseHTTPRequestHandler):
     return self.send({'ok':True,'ref':ref,'message':'Recarga SIMULADA registrada. No hubo cobro ni movimiento bancario'},201)
    if route=='/api/logout':
     self._session_cookie=''
-    tokenhash=hashlib.sha256(self.headers['Authorization'][7:].encode()).hexdigest(); c.execute('DELETE FROM sessions WHERE tokenhash=?',(tokenhash,)); return self.send({'ok':True})
+    tokenhash=hashlib.sha256(self.headers['Authorization'][7:].encode()).hexdigest(); c.execute('DELETE FROM sessions WHERE tokenhash=?',(tokenhash,)); c.commit(); return self.send({'ok':True})
    if route=='/api/recharge-demo':
     need(u['role']=='user','Solo usuario',403)
     amount=b.get('amount'); need(type(amount)==int and 10000<=amount<=500000,'Monto entre $10.000 y $500.000')
     method=str(b.get('method','Nequi')); need(method in ('Nequi','DaviPlata','PSE','Tarjeta'),'Medio inválido')
     ref='DEMO-'+secrets.token_hex(6).upper()
     c.execute('UPDATE accounts SET points=points+? WHERE id=?',(amount,u['id']))
-    c.execute('INSERT INTO movements(account_id,delta,kind,reference,created) VALUES(?,?,?,?,?)',(u['id'],amount,'recarga-demo',ref+' / '+method,int(time.time())))
-    return self.send({'ok':True,'ref':ref,'message':'Recarga SIMULADA registrada; no hubo cobro bancario'})
+    c.execute('INSERT INTO movements(account_id,delta,kind,reference,created) VALUES(?,?,?,?,?)',(u['id'],amount,'recarga-demo',ref+' / '+method,time.time()))
+    c.commit(); return self.send({'ok':True,'ref':ref,'message':'Recarga SIMULADA registrada; no hubo cobro bancario'})
    if route=='/api/charge':
     need(u['role']=='merchant','Solo comercios',403)
     amount=b.get('amount'); need(type(amount)==int and 100<=amount<=2000000,'Monto entre 100 y 2.000.000')
     s=c.execute('SELECT * FROM stores WHERE owner=? AND active=1',(u['id'],)).fetchone();need(s is not None,'Comercio no habilitado',403)
-    code='LG-'+secrets.token_hex(7).upper();c.execute('INSERT INTO charges(code,store_id,amount,created) VALUES(?,?,?,?)',(code,s['id'],amount,int(time.time())))
-    return self.send({'ok':True,'code':code})
+    code='LG-'+secrets.token_hex(7).upper();c.execute('INSERT INTO charges(code,store_id,amount,created) VALUES(?,?,?,?)',(code,s['id'],amount,time.time()))
+    c.commit(); return self.send({'ok':True,'code':code})
    if route=='/api/pay-qr':
     need(u['role']=='user','Solo usuario',403)
     code=str(b.get('code','')).strip().upper().replace('LUMIGO-DEMO:','')
@@ -270,28 +298,49 @@ class Handler(BaseHTTPRequestHandler):
     need(q is not None,'Cobro inexistente',404);need(q['state']=='pending','Cobro ya procesado',409);need(q['active']==1,'Comercio suspendido',403)
     result=c.execute('UPDATE accounts SET points=points-? WHERE id=? AND points>=?',(q['amount'],u['id'],q['amount']))
     need(result.rowcount==1,'Saldo insuficiente',409)
-    result=c.execute("UPDATE charges SET state='paid',payer=?,paid=? WHERE id=? AND state='pending'",(u['id'],int(time.time()),q['id']))
+    result=c.execute("UPDATE charges SET state='paid',payer=?,paid=? WHERE id=? AND state='pending'",(u['id'],time.time(),q['id']))
     need(result.rowcount==1,'Cobro ya procesado',409)
-    c.execute('INSERT INTO movements(account_id,delta,kind,reference,created) VALUES(?,?,?,?,?)',(u['id'],-q['amount'],'pago-qr-demo',code,int(time.time())))
-    return self.send({'ok':True,'code':code,'amount':q['amount']})
+    c.execute('INSERT INTO movements(account_id,delta,kind,reference,created) VALUES(?,?,?,?,?)',(u['id'],-q['amount'],'pago-qr-demo',code,time.time()))
+    c.commit(); return self.send({'ok':True,'code':code,'amount':q['amount']})
    if route=='/api/buy':
     need(u['role']=='user','Solo usuario',403);pid=b.get('product_id');need(type(pid)==int,'Producto inválido')
     p=c.execute('SELECT p.*,s.active FROM products p JOIN stores s ON s.id=p.store_id WHERE p.id=?',(pid,)).fetchone()
     need(p is not None and p['active']==1,'Producto no disponible',404)
     need(c.execute('UPDATE products SET stock=stock-1 WHERE id=? AND stock>0',(pid,)).rowcount==1,'Sin inventario',409)
     need(c.execute('UPDATE accounts SET points=points-? WHERE id=? AND points>=?',(p['price'],u['id'],p['price'])).rowcount==1,'Saldo insuficiente',409)
-    ref='BUY-'+secrets.token_hex(6).upper(); c.execute('INSERT INTO purchases(account_id,store_id,product_id,amount,created) VALUES(?,?,?,?,?)',(u['id'],p['store_id'],pid,p['price'],int(time.time())))
-    c.execute('INSERT INTO movements(account_id,delta,kind,reference,created) VALUES(?,?,?,?,?)',(u['id'],-p['price'],'compra-demo',ref,int(time.time())))
-    return self.send({'ok':True,'ref':ref})
+    ref='BUY-'+secrets.token_hex(6).upper(); c.execute('INSERT INTO purchases(account_id,store_id,product_id,amount,created,product_name,store_name,reference) VALUES(?,?,?,?,?,?,?,?)',(u['id'],p['store_id'],pid,p['price'],time.time(),p['name'],c.execute('SELECT name FROM stores WHERE id=?',(p['store_id'],)).fetchone()['name'],ref))
+    c.execute('INSERT INTO movements(account_id,delta,kind,reference,created) VALUES(?,?,?,?,?)',(u['id'],-p['price'],'compra-demo',ref,time.time()))
+    c.commit(); return self.send({'ok':True,'ref':ref})
+   if route=='/api/reset-view':
+    need(u['role'] in ('admin','merchant'),'Sin permiso',403)
+    target=b.get('target_id');request_id=b.get('request_id')
+    need(type(target)==int and b.get('confirmation')=='REINICIAR VISTA','Escribe REINICIAR VISTA para confirmar')
+    need(isinstance(request_id,str) and 16<=len(request_id)<=80,'Identificador inválido')
+    account=c.execute('SELECT id,role FROM accounts WHERE id=?',(target,)).fetchone()
+    need(account is not None and account['role'] in ('user','merchant'),'Cuenta no válida',404)
+    need(u['role']=='admin' or target==u['id'],'Solo puedes reiniciar tu propia vista',403)
+    previous=c.execute('SELECT actor_id,target_id FROM reset_audit WHERE request_id=?',(request_id,)).fetchone()
+    if previous:
+     need(previous['actor_id']==u['id'] and previous['target_id']==target,'Identificador ya utilizado',409)
+     c.commit(); return self.send({'ok':True,'replayed':True})
+    now=time.time()
+    c.execute('INSERT INTO report_markers(account_id,cutoff) VALUES(?,?) ON CONFLICT(account_id) DO UPDATE SET cutoff=excluded.cutoff',(target,now))
+    c.execute('INSERT INTO reset_audit(actor_id,target_id,created,request_id) VALUES(?,?,?,?)',(u['id'],target,now,request_id));c.commit()
+    return self.send({'ok':True,'message':'Vista reiniciada. El historial completo, saldos, productos, fotos y cuentas se conservan.'})
    if route=='/api/product-update':
     need(u['role']=='merchant','Solo comercio',403)
-    pid=b.get('product_id');name=b.get('name');stock=b.get('stock');expected=b.get('expected_stock')
+    pid=b.get('product_id');name=b.get('name');stock=b.get('stock');expected=b.get('expected_stock');price=b.get('price');expected_price=b.get('expected_price')
     need(type(pid)==int and isinstance(name,str) and type(stock)==int and type(expected)==int,'Revisa los datos del producto')
     name=name.strip();need(2<=len(name)<=80 and 0<=stock<=100000,'Nombre entre 2 y 80 caracteres y cantidad entre 0 y 100.000')
     p=c.execute('SELECT p.id,p.stock,s.owner FROM products p JOIN stores s ON s.id=p.store_id WHERE p.id=?',(pid,)).fetchone()
     need(p is not None,'Producto no encontrado',404);need(p['owner']==u['id'],'No puedes editar productos de otro comercio',403)
     need(p['stock']==expected,'El inventario cambió. Actualiza la página y revisa la cantidad antes de guardar',409)
-    c.execute('UPDATE products SET name=?,stock=? WHERE id=?',(name,stock,pid));c.commit()
+    current_price=c.execute('SELECT price FROM products WHERE id=?',(pid,)).fetchone()['price']
+    if price is None: price=current_price
+    else:
+     need(type(price)==int and 100<=price<=10000000,'Precio entero entre 100 y 10.000.000 puntos')
+     need(type(expected_price)==int and expected_price==current_price,'El precio cambió. Actualiza la página antes de guardar',409)
+    c.execute('UPDATE products SET name=?,stock=?,price=? WHERE id=?',(name,stock,price,pid));c.commit()
     return self.send({'ok':True})
    if route=='/api/media-upload':
     kind=b.get('kind');target=b.get('target_id')
@@ -312,7 +361,7 @@ class Handler(BaseHTTPRequestHandler):
     except ValueError as exc: raise APIError(str(exc))
     if kind in ('avatar','product'): c.execute('DELETE FROM media WHERE kind=? AND target_id=?',(kind,target))
     image_id=secrets.token_hex(20)
-    c.execute('INSERT INTO media VALUES(?,?,?,?,?,?)',(image_id,kind,target,u['id'],data,int(time.time())));c.commit()
+    c.execute('INSERT INTO media VALUES(?,?,?,?,?,?)',(image_id,kind,target,u['id'],data,time.time()));c.commit()
     return self.send({'ok':True,'id':image_id,'url':'/api/media/'+image_id},201)
    if route=='/api/media-delete':
     image_id=b.get('image_id');need(isinstance(image_id,str),'Imagen inválida')
@@ -325,13 +374,13 @@ class Handler(BaseHTTPRequestHandler):
      owner=c.execute('SELECT owner FROM stores WHERE id=?',(item['target_id'],)).fetchone()
      allowed=u['role']=='merchant' and owner is not None and owner['owner']==u['id']
     need(allowed,'Sin permiso para eliminar esta imagen',403)
-    c.execute('DELETE FROM media WHERE id=?',(image_id,));c.commit();return self.send({'ok':True})
+    c.execute('DELETE FROM media WHERE id=?',(image_id,));c.commit(); return self.send({'ok':True})
    if route=='/api/product':
     need(u['role']=='merchant','Solo comercio',403)
     s=c.execute('SELECT id FROM stores WHERE owner=?',(u['id'],)).fetchone();need(s is not None,'Comercio sin perfil',403)
     name=str(b.get('name','')).strip();price=b.get('price');stock=b.get('stock')
     need(2<=len(name)<=80 and type(price)==int and 100<=price<=10000000 and type(stock)==int and 0<=stock<=100000,'Producto inválido')
-    c.execute('INSERT INTO products(store_id,name,price,stock) VALUES(?,?,?,?)',(s['id'],name,price,stock));return self.send({'ok':True})
+    c.execute('INSERT INTO products(store_id,name,price,stock) VALUES(?,?,?,?)',(s['id'],name,price,stock));c.commit(); return self.send({'ok':True})
    if route=='/api/admin-create-store':
     need(u['role']=='admin','Solo administrador',403)
     name=b.get('name'); owner_name=b.get('owner_name'); email=b.get('email'); password=b.get('password')
@@ -341,7 +390,7 @@ class Handler(BaseHTTPRequestHandler):
     need(len(email)<=150 and email.count('@')==1 and all(email.split('@')) and not any(ch.isspace() for ch in email),'Correo inválido')
     need(12<=len(password)<=256,'La contraseña debe tener entre 12 y 256 caracteres')
     need(not c.execute('SELECT 1 FROM accounts WHERE email=?',(email,)).fetchone(),'Este correo ya está registrado; usa un correo nuevo para el comercio',409)
-    owner=c.execute('INSERT INTO accounts(name,email,passhash,role,points,created) VALUES(?,?,?,?,0,?)',(owner_name,email,pwd(password),'merchant',int(time.time()))).lastrowid
+    owner=c.execute('INSERT INTO accounts(name,email,passhash,role,points,created) VALUES(?,?,?,?,0,?)',(owner_name,email,pwd(password),'merchant',time.time())).lastrowid
     store_id=c.execute('INSERT INTO stores(name,owner,active) VALUES(?,?,1)',(name,owner)).lastrowid
     c.commit()
     return self.send({'ok':True,'store':{'id':store_id,'name':name,'active':1},'email':email},201)
@@ -350,12 +399,13 @@ class Handler(BaseHTTPRequestHandler):
     store_id=b.get('store_id'); active=b.get('active')
     need(type(store_id)==int and type(active)==bool,'Parámetros inválidos')
     need(c.execute('UPDATE stores SET active=? WHERE id=?',(int(active),store_id)).rowcount==1,'No existe comercio',404)
-    return self.send({'ok':True})
+    c.commit(); return self.send({'ok':True})
   raise APIError('Ruta inexistente',404)
 
 if __name__=='__main__':
  if not GATE_USER or len(GATE_PASSWORD)<24:
   raise SystemExit('Configura LUMIGO_GATE_USER y LUMIGO_GATE_PASSWORD (min. 24 caracteres) antes de exponer la demo.')
+ validate_storage(DB)
  init()
  print('LumiGo DEMO privado: operaciones simuladas',flush=True)
  ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()

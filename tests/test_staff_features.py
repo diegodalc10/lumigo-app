@@ -3,6 +3,9 @@ import base64
 import importlib.util
 import json
 import io
+import sqlite3
+import zipfile
+import xml.etree.ElementTree as ET
 from PIL import Image
 import os
 from pathlib import Path
@@ -62,6 +65,60 @@ class StaffFeatures(unittest.TestCase):
         os.environ.clear()
         os.environ.update(cls.saved_env)
         cls.temp.cleanup()
+
+    def test_reports_preserve_purchase_name_price_and_reset_only_view(self):
+        product=self.request('/api/manage-products',headers=self.sessions['MERCHANT'])[2]['items'][0]
+        purchase=self.request('/api/buy',{'product_id':product['id']},self.sessions['USER'])
+        self.assertEqual(purchase[0],200)
+        products=self.request('/api/manage-products',headers=self.sessions['MERCHANT'])[2]['items']
+        current=next(p for p in products if p['id']==product['id'])
+        edit={'product_id':current['id'],'name':'Nuevo nombre después de compra','stock':current['stock'],'expected_stock':current['stock'],'price':current['price']+500,'expected_price':current['price']}
+        self.assertEqual(self.request('/api/product-update',edit,self.sessions['MERCHANT'])[0],200)
+        self.assertEqual(self.request('/api/product-update',edit,self.sessions['MERCHANT'])[0],409)
+        records=self.request('/api/records?all=1',headers=self.sessions['USER'])[2]['items']
+        original=next(r for r in records if r['reference']==purchase[2]['ref'])
+        self.assertEqual(original['amount'],product['price'])
+        self.assertEqual(original['product'],product['name'])
+        merchant=self.request('/api/me',headers=self.sessions['MERCHANT'])[2]
+        data={'target_id':merchant['id'],'confirmation':'REINICIAR VISTA','request_id':secrets.token_urlsafe(24)}
+        self.assertEqual(self.request('/api/reset-view',data,self.sessions['USER'])[0],403)
+        self.assertEqual(self.request('/api/reset-view',data,self.sessions['OPERATOR'])[0],403)
+        self.assertEqual(self.request('/api/reset-view',dict(data,confirmation='no'),self.sessions['MERCHANT'])[0],400)
+        self.assertEqual(self.request('/api/reset-view',data,self.sessions['MERCHANT'])[0],200)
+        self.assertEqual(self.request('/api/records',headers=self.sessions['MERCHANT'])[2]['items'],[])
+        full=self.request('/api/records?all=1',headers=self.sessions['MERCHANT'])[2]['items']
+        self.assertTrue(any(r['reference']==purchase[2]['ref'] for r in full))
+        self.assertTrue(self.request('/api/reset-view',data,self.sessions['MERCHANT'])[2]['replayed'])
+        # Purchases after the reset are visible even within the same second.
+        after=self.request('/api/buy',{'product_id':product['id']},self.sessions['USER'])
+        self.assertEqual(after[0],200)
+        visible=self.request('/api/records',headers=self.sessions['MERCHANT'])[2]['items']
+        self.assertTrue(any(r['reference']==after[2]['ref'] for r in visible))
+        self.assertFalse(any(r['reference']==purchase[2]['ref'] for r in visible))
+        self.assertEqual(self.request('/api/reset-view',dict(data,target_id=1,request_id=secrets.token_urlsafe(24)),self.sessions['MERCHANT'])[0],403)
+        self.app.init()
+        self.assertTrue(any(r['reference']==purchase[2]['ref'] for r in self.request('/api/records?all=1',headers=self.sessions['USER'])[2]['items']))
+
+    def test_excel_and_native_backup(self):
+        for role in ('ADMIN','MERCHANT','USER'):
+            status,headers,data=self.request('/api/export.xlsx?days=7',headers=self.sessions[role])
+            self.assertEqual(status,200)
+            self.assertIn('.xlsx',headers['Content-Disposition'])
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                for name in archive.namelist():
+                    if name.endswith('.xml') or name.endswith('.rels'): ET.fromstring(archive.read(name))
+                self.assertIn('xl/charts/chart1.xml',archive.namelist())
+                self.assertIn('xl/charts/chart2.xml',archive.namelist())
+        self.assertEqual(self.request('/api/backup',headers=self.sessions['MERCHANT'])[0],403)
+        backup=self.request('/api/backup',headers=self.sessions['ADMIN'])
+        self.assertEqual(backup[0],200)
+        with tempfile.TemporaryDirectory() as directory:
+            path=Path(directory)/'backup.sqlite3';path.write_bytes(backup[2])
+            with sqlite3.connect(path) as restored:
+                self.assertEqual(restored.execute('PRAGMA integrity_check').fetchone()[0],'ok')
+                self.assertEqual(restored.execute('SELECT count(*) FROM sessions').fetchone()[0],0)
+                with self.app.connect() as live:
+                    self.assertEqual(restored.execute('SELECT count(*) FROM accounts').fetchone()[0],live.execute('SELECT count(*) FROM accounts').fetchone()[0])
 
     def image_payload(self):
         stream=io.BytesIO()
