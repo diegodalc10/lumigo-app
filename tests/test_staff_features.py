@@ -2,6 +2,8 @@
 import base64
 import importlib.util
 import json
+import io
+from PIL import Image
 import os
 from pathlib import Path
 import secrets
@@ -60,6 +62,78 @@ class StaffFeatures(unittest.TestCase):
         os.environ.clear()
         os.environ.update(cls.saved_env)
         cls.temp.cleanup()
+
+    def image_payload(self):
+        stream=io.BytesIO()
+        Image.new('RGB',(30,20),'blue').save(stream,format='PNG')
+        return base64.b64encode(stream.getvalue()).decode()
+
+    def test_product_images_permissions_and_inventory_conflict(self):
+        product=self.request('/api/manage-products',headers=self.sessions['MERCHANT'])[2]['items'][0]
+        payload={'kind':'product','target_id':product['id'],'data':self.image_payload()}
+        self.assertEqual(self.request('/api/media-upload',payload,self.sessions['USER'])[0],403)
+        self.assertEqual(self.request('/api/media-upload',payload,self.sessions['OPERATOR'])[0],403)
+        status,_,photo=self.request('/api/media-upload',payload,self.sessions['MERCHANT'])
+        self.assertEqual(status,201)
+        image=self.request(photo['url'],headers=self.sessions['USER'])
+        self.assertEqual(image[0],200)
+        self.assertEqual(image[1]['Content-Type'],'image/jpeg')
+        self.assertEqual(Image.open(io.BytesIO(image[2])).format,'JPEG')
+        self.assertEqual(self.request(photo['url'])[0],401)
+        self.assertEqual(self.request('/api/media-upload',dict(payload,data='not base64'),self.sessions['ADMIN'])[0],400)
+        self.assertEqual(self.request(photo['url'],headers=self.sessions['USER'])[0],200)
+        replacement=self.request('/api/media-upload',payload,self.sessions['ADMIN'])
+        self.assertEqual(replacement[0],201)
+        self.assertEqual(self.request(photo['url'],headers=self.sessions['USER'])[0],404)
+        data={'product_id':product['id'],'name':'Producto actualizado','stock':12,'expected_stock':product['stock']}
+        self.assertEqual(self.request('/api/product-update',data,self.sessions['USER'])[0],403)
+        self.assertEqual(self.request('/api/product-update',dict(data,stock=-1),self.sessions['MERCHANT'])[0],400)
+        self.assertEqual(self.request('/api/product-update',data,self.sessions['MERCHANT'])[0],200)
+        self.assertEqual(self.request('/api/product-update',dict(data,expected_stock=-1),self.sessions['MERCHANT'])[0],409)
+        updated=next(p for p in self.request('/api/manage-products',headers=self.sessions['MERCHANT'])[2]['items'] if p['id']==product['id'])
+        self.assertEqual((updated['name'],updated['stock']),('Producto actualizado',12))
+        self.assertEqual(updated['image_url'],replacement[2]['url'])
+        self.assertEqual(self.request('/api/media-delete',{'image_id':replacement[2]['id']},self.sessions['USER'])[0],403)
+        self.assertEqual(self.request('/api/media-delete',{'image_id':replacement[2]['id']},self.sessions['MERCHANT'])[0],200)
+
+    def test_avatar_private_cookie_and_gallery_limit(self):
+        status,_,photo=self.request('/api/media-upload',{'kind':'avatar','data':self.image_payload(),'target_id':999999},self.sessions['USER'])
+        self.assertEqual(status,201)
+        self.assertEqual(self.request(photo['url'],headers=self.sessions['ADMIN'])[0],403)
+        self.assertEqual(self.request(photo['url'],headers=self.sessions['USER'])[0],200)
+        status,headers,me=self.request('/api/me',headers=self.sessions['USER'])
+        self.assertEqual(me['photo_url'],photo['url'])
+        self.assertIn('HttpOnly',headers['Set-Cookie'])
+        self.assertIn('Secure',headers['Set-Cookie'])
+        media_cookie=self.cookie+'; '+headers['Set-Cookie'].split(';')[0]
+        self.assertEqual(self.request(photo['url'],headers={'Cookie':media_cookie})[0],200)
+        # Cookie-only media access cannot authorize mutations.
+        self.assertEqual(self.request('/api/media-upload',{'kind':'avatar','data':self.image_payload()}, {'Cookie':media_cookie})[0],401)
+        store=self.request('/api/my-store',headers=self.sessions['MERCHANT'])[2]['store']
+        data={'kind':'store','target_id':store['id'],'data':self.image_payload()}
+        self.assertEqual(self.request('/api/media-upload',data,self.sessions['USER'])[0],403)
+        ids=[]
+        for _ in range(6):
+            status,_,result=self.request('/api/media-upload',data,self.sessions['MERCHANT'])
+            self.assertEqual(status,201)
+            ids.append(result['id'])
+        self.assertEqual(self.request('/api/media-upload',data,self.sessions['MERCHANT'])[0],409)
+        self.assertEqual(self.request('/api/media-delete',{'image_id':ids[0]},self.sessions['MERCHANT'])[0],200)
+        self.assertEqual(self.request('/api/media-upload',data,self.sessions['MERCHANT'])[0],201)
+        self.assertEqual(len(self.request('/api/my-store',headers=self.sessions['MERCHANT'])[2]['store']['images']),6)
+
+    def test_other_merchant_cannot_modify_products_or_business(self):
+        with self.app.connect() as c:
+            password=secrets.token_urlsafe(24)
+            uid=c.execute("INSERT INTO accounts(name,email,passhash,role,points,created) VALUES(?,?,?,'merchant',0,0)",('Other','othermerchant@demo',self.app.pwd(password))).lastrowid
+            sid=c.execute('INSERT INTO stores(name,owner) VALUES(?,?)',('Other shop',uid)).lastrowid
+            pid=c.execute('INSERT INTO products(store_id,name,price,stock) VALUES(?,?,?,?)',(sid,'Other product',1000,5)).lastrowid
+        data={'kind':'product','target_id':pid,'data':self.image_payload()}
+        self.assertEqual(self.request('/api/media-upload',data,self.sessions['MERCHANT'])[0],403)
+        self.assertEqual(self.request('/api/product-update',{'product_id':pid,'name':'Wrong','stock':0,'expected_stock':5},self.sessions['MERCHANT'])[0],403)
+        self.assertEqual(self.request('/api/media-upload',dict(data,kind='store',target_id=sid),self.sessions['MERCHANT'])[0],403)
+        managed=self.request('/api/manage-products',headers=self.sessions['MERCHANT'])[2]['items']
+        self.assertNotIn(pid,[p['id'] for p in managed])
 
     def test_dashboard_routes_and_protected_assets(self):
         for role in self.sessions:

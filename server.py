@@ -3,6 +3,7 @@ import base64, hashlib, hmac, io, json, os, secrets, sqlite3, threading, time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from dashboard import build_dashboard
+from media import prepare_image, image_url
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs
 
@@ -38,6 +39,8 @@ def init():
   CREATE TABLE IF NOT EXISTS movements(id INTEGER PRIMARY KEY,account_id INTEGER NOT NULL,delta INTEGER NOT NULL,kind TEXT NOT NULL,reference TEXT NOT NULL,created INTEGER NOT NULL,FOREIGN KEY(account_id) REFERENCES accounts(id));
   CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,name TEXT NOT NULL,starts_at TEXT NOT NULL,location TEXT NOT NULL,description TEXT NOT NULL,created_by INTEGER NOT NULL REFERENCES accounts(id),created INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS admin_recharges(id INTEGER PRIMARY KEY,request_id TEXT UNIQUE NOT NULL,account_id INTEGER NOT NULL REFERENCES accounts(id),actor_id INTEGER NOT NULL REFERENCES accounts(id),amount INTEGER NOT NULL CHECK(amount>0),note TEXT NOT NULL,reference TEXT UNIQUE NOT NULL,created INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS media(id TEXT PRIMARY KEY,kind TEXT NOT NULL CHECK(kind IN ('avatar','product','store')),target_id INTEGER NOT NULL,owner_id INTEGER NOT NULL REFERENCES accounts(id),data BLOB NOT NULL,created INTEGER NOT NULL);
+  CREATE UNIQUE INDEX IF NOT EXISTS media_single ON media(kind,target_id) WHERE kind IN ('avatar','product');
   CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY,account_id INTEGER NOT NULL,store_id INTEGER NOT NULL,product_id INTEGER NOT NULL,amount INTEGER NOT NULL,created INTEGER NOT NULL);
   ''')
   if not c.execute('SELECT 1 FROM accounts LIMIT 1').fetchone():
@@ -84,13 +87,18 @@ class Handler(BaseHTTPRequestHandler):
   data=json.dumps(obj,ensure_ascii=False).encode() if ctype.startswith('application/json') else obj
   self.send_response(status)
   if getattr(self,'_issue_demo_cookie',None): self.send_header('Set-Cookie','lumigo_demo_gate='+self._issue_demo_cookie+'; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=28800')
+  if hasattr(self,'_session_cookie'): self.send_header('Set-Cookie','lumigo_session='+self._session_cookie+'; Path=/api/media/; Secure; HttpOnly; SameSite=Strict; Max-Age='+('86400' if self._session_cookie else '0'))
   self.send_header('Content-Type',ctype); self.send_header('Content-Length',str(len(data))); self.send_header('Cache-Control','no-store'); self.send_header('X-Content-Type-Options','nosniff'); self.send_header('X-Frame-Options','DENY'); self.end_headers(); self.wfile.write(data)
  def body(self):
-  n=int(self.headers.get('Content-Length','0')); need(0<n<=20000,'Solicitud inválida')
+  n=int(self.headers.get('Content-Length','0')); limit=7*1024*1024 if urlparse(self.path).path=='/api/media-upload' else 20000; need(0<n<=limit,'Solicitud inválida o imagen demasiado grande')
   try: val=json.loads(self.rfile.read(n)); need(isinstance(val,dict),'Objeto JSON requerido'); return val
   except (ValueError,UnicodeError): raise APIError('JSON inválido')
- def current(self,c):
+ def current(self,c,allow_cookie=False):
   auth=self.headers.get('Authorization','')
+  if allow_cookie and not auth.startswith('Bearer '):
+   for item in self.headers.get('Cookie','').split(';'):
+    name,_,value=item.strip().partition('=')
+    if name=='lumigo_session': auth='Bearer '+value
   need(auth.startswith('Bearer '),'Inicia sesión',401)
   key=hashlib.sha256(auth[7:].encode()).hexdigest()
   row=c.execute('SELECT a.* FROM sessions s JOIN accounts a ON a.id=s.user_id WHERE s.tokenhash=? AND s.expires>?',(key,int(time.time()))).fetchone()
@@ -108,10 +116,18 @@ class Handler(BaseHTTPRequestHandler):
  def get(self):
   route=urlparse(self.path).path
   if route=='/' or route=='/index.html': return self.send((ROOT/'public/index.html').read_bytes(),200,'text/html; charset=utf-8')
-  if route in ('/dashboard.js','/dashboard.css'):
+  if route in ('/dashboard.js','/dashboard.css','/media-ui.js','/media-ui.css'):
    return self.send((ROOT/'public'/route[1:]).read_bytes(),200,'text/javascript; charset=utf-8' if route.endswith('.js') else 'text/css; charset=utf-8')
   if route=='/manifest.json': return self.send((ROOT/'public/manifest.json').read_bytes(),200,'application/manifest+json')
   if route=='/api/health': return self.send({'ok':True,'mode':'DEMO','payments_real':False})
+  if route.startswith('/api/media/'):
+   media_id=route.rsplit('/',1)[-1]
+   with connect() as c:
+    u=self.current(c,allow_cookie=True)
+    item=c.execute('SELECT * FROM media WHERE id=?',(media_id,)).fetchone()
+    need(item is not None,'Imagen no encontrada',404)
+    need(item['kind']!='avatar' or item['target_id']==u['id'],'Sin permiso',403)
+    return self.send(bytes(item['data']),200,'image/jpeg')
   if route.startswith('/api/qr/'):
    code=route.split('/')[-1]
    with connect() as c: row=c.execute('SELECT code FROM charges WHERE code=?',(code,)).fetchone()
@@ -122,14 +138,31 @@ class Handler(BaseHTTPRequestHandler):
    except ImportError: raise APIError('Instala qrcode y pillow para generar QR PNG')
   with connect() as c:
    u=self.current(c)
-   if route=='/api/me': return self.send({'id':u['id'],'name':u['name'],'email':u['email'],'role':u['role'],'points':u['points']})
+   if route=='/api/me':
+    self._session_cookie=self.headers['Authorization'][7:]
+    return self.send({'id':u['id'],'name':u['name'],'email':u['email'],'role':u['role'],'points':u['points'],'photo_url':image_url(c,'avatar',u['id'])})
    if route=='/api/lookup':
     code=parse_qs(urlparse(self.path).query).get('code',[''])[0].strip().upper()
     r=c.execute('SELECT q.code,q.amount,q.state,s.name AS store_name FROM charges q JOIN stores s ON s.id=q.store_id WHERE q.code=? AND s.active=1',(code,)).fetchone()
     need(r is not None,'Cobro inexistente',404)
     return self.send({'charge':dict(r)})
-   if route=='/api/products': return self.send({'items':[dict(x) for x in c.execute('SELECT p.*,s.name AS store_name FROM products p JOIN stores s ON s.id=p.store_id WHERE s.active=1 ORDER BY p.id DESC')]})
-   if route=='/api/stores': return self.send({'items':[dict(x) for x in c.execute('SELECT id,name,active FROM stores ORDER BY id')]})
+   if route in ('/api/products','/api/manage-products'):
+    manage=route=='/api/manage-products'
+    if manage: need(u['role'] in ('merchant','admin'),'Sin permiso',403)
+    condition='s.owner=?' if manage and u['role']=='merchant' else '1=1' if manage else 's.active=1'
+    items=[dict(x) for x in c.execute('SELECT p.*,s.name AS store_name FROM products p JOIN stores s ON s.id=p.store_id WHERE '+condition+' ORDER BY p.id DESC',(u['id'],) if manage and u['role']=='merchant' else ())]
+    for item in items: item['image_url']=image_url(c,'product',item['id'])
+    return self.send({'items':items})
+   if route=='/api/my-store':
+    need(u['role']=='merchant','Solo comercio',403)
+    row=c.execute('SELECT id,name,active FROM stores WHERE owner=?',(u['id'],)).fetchone();need(row is not None,'Comercio no encontrado',404)
+    store=dict(row);store['images']=[{'id':x['id'],'url':'/api/media/'+x['id']} for x in c.execute("SELECT id FROM media WHERE kind='store' AND target_id=? ORDER BY created,id",(store['id'],))]
+    return self.send({'store':store})
+
+   if route=='/api/stores':
+    items=[dict(x) for x in c.execute('SELECT id,name,active FROM stores ORDER BY id')]
+    for item in items: item['images']=[{'id':x['id'],'url':'/api/media/'+x['id']} for x in c.execute("SELECT id FROM media WHERE kind='store' AND target_id=? ORDER BY created,id",(item['id'],))]
+    return self.send({'items':items})
    if route=='/api/movements': return self.send({'items':[dict(x) for x in c.execute('SELECT id,delta,kind,reference,created FROM movements WHERE account_id=? ORDER BY id DESC LIMIT 100',(u['id'],))]})
    if route=='/api/charges':
     if u['role']=='merchant': rows=c.execute('SELECT q.*,s.name store_name,a.name payer_name FROM charges q JOIN stores s ON s.id=q.store_id LEFT JOIN accounts a ON a.id=q.payer WHERE s.owner=? ORDER BY q.id DESC',(u['id'],))
@@ -159,6 +192,7 @@ class Handler(BaseHTTPRequestHandler):
     u=c.execute('SELECT * FROM accounts WHERE email=?',(email,)).fetchone()
     need(u is not None and verify(password,u['passhash']),'Credenciales incorrectas',401)
     token=secrets.token_urlsafe(40); c.execute('INSERT INTO sessions VALUES(?,?,?)',(hashlib.sha256(token.encode()).hexdigest(),u['id'],int(time.time())+86400))
+   self._session_cookie=token
    return self.send({'token':token})
   if route=='/api/register':
    name=str(b.get('name','')).strip(); email=str(b.get('email','')).strip().lower(); password=str(b.get('password',''))
@@ -213,6 +247,7 @@ class Handler(BaseHTTPRequestHandler):
     c.commit()
     return self.send({'ok':True,'ref':ref,'message':'Recarga SIMULADA registrada. No hubo cobro ni movimiento bancario'},201)
    if route=='/api/logout':
+    self._session_cookie=''
     tokenhash=hashlib.sha256(self.headers['Authorization'][7:].encode()).hexdigest(); c.execute('DELETE FROM sessions WHERE tokenhash=?',(tokenhash,)); return self.send({'ok':True})
    if route=='/api/recharge-demo':
     need(u['role']=='user','Solo usuario',403)
@@ -248,6 +283,49 @@ class Handler(BaseHTTPRequestHandler):
     ref='BUY-'+secrets.token_hex(6).upper(); c.execute('INSERT INTO purchases(account_id,store_id,product_id,amount,created) VALUES(?,?,?,?,?)',(u['id'],p['store_id'],pid,p['price'],int(time.time())))
     c.execute('INSERT INTO movements(account_id,delta,kind,reference,created) VALUES(?,?,?,?,?)',(u['id'],-p['price'],'compra-demo',ref,int(time.time())))
     return self.send({'ok':True,'ref':ref})
+   if route=='/api/product-update':
+    need(u['role']=='merchant','Solo comercio',403)
+    pid=b.get('product_id');name=b.get('name');stock=b.get('stock');expected=b.get('expected_stock')
+    need(type(pid)==int and isinstance(name,str) and type(stock)==int and type(expected)==int,'Revisa los datos del producto')
+    name=name.strip();need(2<=len(name)<=80 and 0<=stock<=100000,'Nombre entre 2 y 80 caracteres y cantidad entre 0 y 100.000')
+    p=c.execute('SELECT p.id,p.stock,s.owner FROM products p JOIN stores s ON s.id=p.store_id WHERE p.id=?',(pid,)).fetchone()
+    need(p is not None,'Producto no encontrado',404);need(p['owner']==u['id'],'No puedes editar productos de otro comercio',403)
+    need(p['stock']==expected,'El inventario cambió. Actualiza la página y revisa la cantidad antes de guardar',409)
+    c.execute('UPDATE products SET name=?,stock=? WHERE id=?',(name,stock,pid));c.commit()
+    return self.send({'ok':True})
+   if route=='/api/media-upload':
+    kind=b.get('kind');target=b.get('target_id')
+    need(kind in ('avatar','product','store'),'Tipo de imagen inválido')
+    if kind=='avatar': target=u['id']
+    else:
+     need(type(target)==int,'Selecciona un producto o establecimiento')
+     if kind=='product':
+      need(u['role'] in ('admin','merchant'),'Sin permiso',403)
+      item=c.execute('SELECT s.owner FROM products p JOIN stores s ON s.id=p.store_id WHERE p.id=?',(target,)).fetchone()
+      need(item is not None,'Producto no encontrado',404);need(u['role']=='admin' or item['owner']==u['id'],'Producto de otro comercio',403)
+     else:
+      need(u['role']=='merchant','Solo comercio',403)
+      item=c.execute('SELECT owner FROM stores WHERE id=?',(target,)).fetchone()
+      need(item is not None,'Establecimiento no encontrado',404);need(item['owner']==u['id'],'Establecimiento de otro comercio',403)
+      need(c.execute("SELECT count(*) FROM media WHERE kind='store' AND target_id=?",(target,)).fetchone()[0]<6,'Máximo 6 fotos por negocio. Elimina una para agregar otra',409)
+    try: data=prepare_image(b.get('data'),kind)
+    except ValueError as exc: raise APIError(str(exc))
+    if kind in ('avatar','product'): c.execute('DELETE FROM media WHERE kind=? AND target_id=?',(kind,target))
+    image_id=secrets.token_hex(20)
+    c.execute('INSERT INTO media VALUES(?,?,?,?,?,?)',(image_id,kind,target,u['id'],data,int(time.time())));c.commit()
+    return self.send({'ok':True,'id':image_id,'url':'/api/media/'+image_id},201)
+   if route=='/api/media-delete':
+    image_id=b.get('image_id');need(isinstance(image_id,str),'Imagen inválida')
+    item=c.execute('SELECT * FROM media WHERE id=?',(image_id,)).fetchone();need(item is not None,'Imagen no encontrada',404)
+    if item['kind']=='avatar': allowed=item['target_id']==u['id']
+    elif item['kind']=='product':
+     owner=c.execute('SELECT s.owner FROM products p JOIN stores s ON s.id=p.store_id WHERE p.id=?',(item['target_id'],)).fetchone()
+     allowed=u['role']=='admin' or (u['role']=='merchant' and owner is not None and owner['owner']==u['id'])
+    else:
+     owner=c.execute('SELECT owner FROM stores WHERE id=?',(item['target_id'],)).fetchone()
+     allowed=u['role']=='merchant' and owner is not None and owner['owner']==u['id']
+    need(allowed,'Sin permiso para eliminar esta imagen',403)
+    c.execute('DELETE FROM media WHERE id=?',(image_id,));c.commit();return self.send({'ok':True})
    if route=='/api/product':
     need(u['role']=='merchant','Solo comercio',403)
     s=c.execute('SELECT id FROM stores WHERE owner=?',(u['id'],)).fetchone();need(s is not None,'Comercio sin perfil',403)

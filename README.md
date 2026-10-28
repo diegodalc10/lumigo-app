@@ -68,3 +68,13 @@ Inicio muestra seis indicadores, una gráfica diaria, distribución de operacion
 - Usuario: su saldo, recargas, consumos, compras, pagos y comercios donde ha utilizado puntos.
 
 Los indicadores de saldo y catálogo son actuales; las operaciones se filtran por el período indicado, usando días de Bogotá. Los saldos iniciales no se representan como recargas. No se inventan movimientos para completar las gráficas. Los endpoints calculan el alcance a partir de la sesión, sin aceptar IDs ajenos como filtros.
+
+## Imágenes y edición de productos
+
+- Todas las cuentas: Mi perfil permite añadir, reemplazar y eliminar su fotografía. Las fotos de perfil solo pueden ser leídas por su propia sesión.
+- Administrador: Productos permite gestionar la fotografía de cualquier producto.
+- Comercio: Productos permite editar nombre y cantidad disponible de sus propios productos, además de sus imágenes. Una cantidad desactualizada se rechaza para evitar sobrescribir ventas recientes.
+- Comercio: Mi negocio admite hasta seis fotografías; los usuarios las ven en Negocios.
+- JPG, PNG o WebP estáticos, hasta 5 MB y 16 megapíxeles. El servidor valida el contenido, corrige orientación, reduce dimensiones y vuelve a codificar en JPEG sin metadatos EXIF.
+- Las imágenes se guardan en SQLite junto a la demo. No se envían a servicios externos. En el plan actual de Render NO son persistentes frente a reinicios/despliegues.
+- Las rutas de imágenes requieren la puerta privada y una sesión de aplicación. Una cookie HttpOnly/Secure limitada a lectura de imágenes permite mostrarlas en el navegador, sin autorizar operaciones de modificación.
