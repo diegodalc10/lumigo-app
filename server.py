@@ -2,6 +2,7 @@
 import base64, hashlib, hmac, io, json, os, secrets, sqlite3, threading, time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs
 
 ROOT=Path(__file__).resolve().parent
@@ -34,6 +35,8 @@ def init():
   CREATE TABLE IF NOT EXISTS products(id INTEGER PRIMARY KEY,store_id INTEGER NOT NULL,name TEXT NOT NULL,price INTEGER NOT NULL CHECK(price>0),stock INTEGER NOT NULL CHECK(stock>=0),icon TEXT NOT NULL DEFAULT '🛍️',FOREIGN KEY(store_id) REFERENCES stores(id));
   CREATE TABLE IF NOT EXISTS charges(id INTEGER PRIMARY KEY,code TEXT UNIQUE NOT NULL,store_id INTEGER NOT NULL,amount INTEGER NOT NULL CHECK(amount>0),state TEXT NOT NULL DEFAULT 'pending',payer INTEGER,created INTEGER NOT NULL,paid INTEGER,FOREIGN KEY(store_id) REFERENCES stores(id));
   CREATE TABLE IF NOT EXISTS movements(id INTEGER PRIMARY KEY,account_id INTEGER NOT NULL,delta INTEGER NOT NULL,kind TEXT NOT NULL,reference TEXT NOT NULL,created INTEGER NOT NULL,FOREIGN KEY(account_id) REFERENCES accounts(id));
+  CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY,name TEXT NOT NULL,starts_at TEXT NOT NULL,location TEXT NOT NULL,description TEXT NOT NULL,created_by INTEGER NOT NULL REFERENCES accounts(id),created INTEGER NOT NULL);
+  CREATE TABLE IF NOT EXISTS admin_recharges(id INTEGER PRIMARY KEY,request_id TEXT UNIQUE NOT NULL,account_id INTEGER NOT NULL REFERENCES accounts(id),actor_id INTEGER NOT NULL REFERENCES accounts(id),amount INTEGER NOT NULL CHECK(amount>0),note TEXT NOT NULL,reference TEXT UNIQUE NOT NULL,created INTEGER NOT NULL);
   CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY,account_id INTEGER NOT NULL,store_id INTEGER NOT NULL,product_id INTEGER NOT NULL,amount INTEGER NOT NULL,created INTEGER NOT NULL);
   ''')
   if not c.execute('SELECT 1 FROM accounts LIMIT 1').fetchone():
@@ -130,6 +133,15 @@ class Handler(BaseHTTPRequestHandler):
     elif u['role'] in ('operator','admin'): rows=c.execute('SELECT q.*,s.name store_name,a.name payer_name FROM charges q JOIN stores s ON s.id=q.store_id LEFT JOIN accounts a ON a.id=q.payer ORDER BY q.id DESC LIMIT 100')
     else: rows=c.execute('SELECT q.*,s.name store_name FROM charges q JOIN stores s ON s.id=q.store_id WHERE q.payer=? ORDER BY q.id DESC',(u['id'],))
     return self.send({'items':[dict(x) for x in rows]})
+   if route=='/api/staff-users':
+    need(u['role'] in ('admin','operator'),'Sin permiso',403)
+    return self.send({'items':[dict(x) for x in c.execute("SELECT id,name,email,points,created FROM accounts WHERE role='user' ORDER BY id DESC")]})
+   if route=='/api/admin-events':
+    need(u['role']=='admin','Solo administrador',403)
+    return self.send({'items':[dict(x) for x in c.execute('SELECT id,name,starts_at,location,description FROM events ORDER BY starts_at DESC,id DESC')]})
+   if route=='/api/admin-recharges':
+    need(u['role']=='admin','Solo administrador',403)
+    return self.send({'items':[dict(x) for x in c.execute('SELECT r.reference,r.amount,r.note,r.created,a.name,a.email,actor.name AS actor_name FROM admin_recharges r JOIN accounts a ON a.id=r.account_id JOIN accounts actor ON actor.id=r.actor_id ORDER BY r.id DESC LIMIT 100')]})
    if route=='/api/dashboard':
     need(u['role'] in ('admin','operator'),'Sin permiso',403)
     return self.send({'users':c.execute("SELECT count(*) FROM accounts WHERE role='user'").fetchone()[0],'stores':c.execute('SELECT count(*) FROM stores').fetchone()[0],'recharges':c.execute("SELECT coalesce(sum(delta),0) FROM movements WHERE kind='recarga-demo'").fetchone()[0],'qr_paid':c.execute("SELECT count(*) FROM charges WHERE state='paid'").fetchone()[0]})
@@ -154,6 +166,48 @@ class Handler(BaseHTTPRequestHandler):
   with LOCK,connect() as c:
    c.execute('BEGIN IMMEDIATE')
    u=self.current(c)
+   if route=='/api/staff-users':
+    need(u['role'] in ('admin','operator'),'Sin permiso',403)
+    name=b.get('name'); email=b.get('email'); password=b.get('password')
+    need(all(isinstance(v,str) for v in (name,email,password)),'Completa nombre, correo y contraseña')
+    name=name.strip(); email=email.strip().lower()
+    need(2<=len(name)<=80,'Nombre entre 2 y 80 caracteres')
+    need(len(email)<=150 and email.count('@')==1 and all(email.split('@')) and not any(ch.isspace() for ch in email),'Correo inválido')
+    need(12<=len(password)<=256,'Contraseña entre 12 y 256 caracteres')
+    need(b.get('role','user')=='user','Solo se pueden crear cuentas de usuario',403)
+    need(not c.execute('SELECT 1 FROM accounts WHERE email=?',(email,)).fetchone(),'Correo ya registrado',409)
+    uid=c.execute('INSERT INTO accounts(name,email,passhash,role,points,created) VALUES(?,?,?,?,0,?)',(name,email,pwd(password),'user',int(time.time()))).lastrowid
+    c.commit()
+    return self.send({'ok':True,'user':{'id':uid,'name':name,'email':email,'role':'user','points':0}},201)
+   if route=='/api/admin-events':
+    need(u['role']=='admin','Solo administrador',403)
+    name=b.get('name'); starts_at=b.get('starts_at'); location=b.get('location'); description=b.get('description','')
+    need(all(isinstance(v,str) for v in (name,starts_at,location,description)),'Completa los datos del evento')
+    name=name.strip(); location=location.strip(); description=description.strip()
+    need(2<=len(name)<=100 and 2<=len(location)<=150 and len(description)<=1000,'Revisa nombre, lugar y descripción')
+    try: event_date=datetime.strptime(starts_at,'%Y-%m-%dT%H:%M').replace(tzinfo=timezone(timedelta(hours=-5)))
+    except ValueError: raise APIError('Fecha y hora inválidas; usa la hora de Bogotá')
+    eid=c.execute('INSERT INTO events(name,starts_at,location,description,created_by,created) VALUES(?,?,?,?,?,?)',(name,event_date.isoformat(),location,description,u['id'],int(time.time()))).lastrowid
+    c.commit()
+    return self.send({'ok':True,'id':eid},201)
+   if route=='/api/admin-recharges':
+    need(u['role']=='admin','Solo administrador',403)
+    account_id=b.get('account_id'); amount=b.get('amount'); note=b.get('note',''); request_id=b.get('request_id')
+    need(type(account_id)==int and type(amount)==int and 10000<=amount<=500000,'Selecciona usuario y entre 10.000 y 500.000 puntos enteros')
+    need(isinstance(note,str) and len(note.strip())<=200,'Observación: máximo 200 caracteres')
+    need(isinstance(request_id,str) and 16<=len(request_id)<=80,'Identificador de operación inválido')
+    note=note.strip()
+    existing=c.execute('SELECT * FROM admin_recharges WHERE request_id=?',(request_id,)).fetchone()
+    if existing:
+     need(existing['actor_id']==u['id'] and existing['account_id']==account_id and existing['amount']==amount and existing['note']==note,'La operación ya existe con otros datos; actualiza la página',409)
+     return self.send({'ok':True,'ref':existing['reference'],'replayed':True,'message':'Esta recarga simulada ya fue registrada; no se duplicó'})
+    need(c.execute("SELECT 1 FROM accounts WHERE id=? AND role='user'",(account_id,)).fetchone() is not None,'Usuario no encontrado',404)
+    ref='DEMO-ADMIN-'+secrets.token_hex(8).upper(); now=int(time.time())
+    c.execute('UPDATE accounts SET points=points+? WHERE id=?',(amount,account_id))
+    c.execute('INSERT INTO movements(account_id,delta,kind,reference,created) VALUES(?,?,?,?,?)',(account_id,amount,'recarga-demo',ref,now))
+    c.execute('INSERT INTO admin_recharges(request_id,account_id,actor_id,amount,note,reference,created) VALUES(?,?,?,?,?,?,?)',(request_id,account_id,u['id'],amount,note,ref,now))
+    c.commit()
+    return self.send({'ok':True,'ref':ref,'message':'Recarga SIMULADA registrada. No hubo cobro ni movimiento bancario'},201)
    if route=='/api/logout':
     tokenhash=hashlib.sha256(self.headers['Authorization'][7:].encode()).hexdigest(); c.execute('DELETE FROM sessions WHERE tokenhash=?',(tokenhash,)); return self.send({'ok':True})
    if route=='/api/recharge-demo':

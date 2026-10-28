@@ -47,3 +47,13 @@ Configura LUMIGO_GATE_USER y LUMIGO_GATE_PASSWORD (mínimo 24 caracteres) como v
 Las cuentas iniciales usan LUMIGO_USER_PASSWORD, LUMIGO_MERCHANT_PASSWORD, LUMIGO_OPERATOR_PASSWORD y LUMIGO_ADMIN_PASSWORD. Si faltan, se generan claves aleatorias que no se muestran. Configura estas variables antes del primer arranque si necesitas acceder a esos roles. Cambiarlas no modifica cuentas ya creadas. Los usuarios también pueden registrarse después de superar la puerta privada.
 
 SQLite es temporal sin un disco persistente: los datos de prueba pueden perderse con reinicios o despliegues. No introduzcas datos personales reales. Recargas, compras y pagos QR solo modifican puntos locales; no hay integraciones de dinero real ni transferencias bancarias.
+
+## Gestión de pruebas por perfil
+
+- Operador y administrador: menú Usuarios para crear cuentas de tipo usuario con nombre, correo único y contraseña de 12 a 256 caracteres. Inician con cero puntos; no permite crear perfiles privilegiados.
+- Administrador: menú Eventos para registrar nombre, fecha y hora de Bogotá, lugar y descripción. Los eventos quedan en el listado administrativo; no envían invitaciones ni venden entradas.
+- Administrador: menú Recargas para asignar entre 10.000 y 500.000 puntos ficticios a un usuario. Solicita confirmación y guarda referencia, beneficiario, administrador, fecha y observación. Reintentar una misma operación no duplica el saldo. La recarga aparece también en el historial del usuario.
+- Las contraseñas no se muestran en listados ni respuestas; se guardan mediante derivación PBKDF2.
+- Las tablas nuevas se crean sin borrar las existentes. Sigue aplicando la limitación del almacenamiento temporal de Render.
+
+Pruebas locales: `python -m unittest discover -s tests -v`. Usan una base temporal y claves aleatorias de prueba; no consultan cuentas del despliegue.
