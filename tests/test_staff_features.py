@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import secrets
 import tempfile
+import sys
 import threading
 import unittest
 import urllib.error
@@ -20,6 +21,7 @@ class StaffFeatures(unittest.TestCase):
         cls.passwords = {role: secrets.token_urlsafe(32) for role in ('USER', 'ADMIN', 'OPERATOR', 'MERCHANT')}
         os.environ.update({f'LUMIGO_{role}_PASSWORD': value for role, value in cls.passwords.items()})
         os.environ.update(LUMIGO_DB=cls.temp.name+'/test.sqlite3', LUMIGO_GATE_USER='test', LUMIGO_GATE_PASSWORD=secrets.token_urlsafe(32))
+        sys.path.insert(0,str(Path(__file__).resolve().parents[1]))
         spec = importlib.util.spec_from_file_location('lumigo_test', Path(__file__).resolve().parents[1]/'server.py')
         cls.app = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cls.app)
@@ -58,6 +60,17 @@ class StaffFeatures(unittest.TestCase):
         os.environ.clear()
         os.environ.update(cls.saved_env)
         cls.temp.cleanup()
+
+    def test_dashboard_routes_and_protected_assets(self):
+        for role in self.sessions:
+            status, _, result = self.request('/api/dashboard?days=7',headers=self.sessions[role])
+            self.assertEqual(status,200)
+            self.assertEqual(result['role'],{'USER':'user','MERCHANT':'merchant','ADMIN':'admin','OPERATOR':'operator'}[role])
+            self.assertEqual(len(result['series']),7)
+        self.assertEqual(self.request('/api/dashboard?days=365',headers=self.sessions['ADMIN'])[0],400)
+        for path in ('/dashboard.js','/dashboard.css'):
+            self.assertEqual(self.request(path)[0],401)
+            self.assertEqual(self.request(path,headers={'Cookie':self.cookie})[0],200)
 
     def test_user_creation_and_privilege_boundaries(self):
         for role in ('ADMIN', 'OPERATOR'):

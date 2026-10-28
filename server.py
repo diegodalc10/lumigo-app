@@ -2,6 +2,7 @@
 import base64, hashlib, hmac, io, json, os, secrets, sqlite3, threading, time
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
+from dashboard import build_dashboard
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, parse_qs
 
@@ -107,6 +108,8 @@ class Handler(BaseHTTPRequestHandler):
  def get(self):
   route=urlparse(self.path).path
   if route=='/' or route=='/index.html': return self.send((ROOT/'public/index.html').read_bytes(),200,'text/html; charset=utf-8')
+  if route in ('/dashboard.js','/dashboard.css'):
+   return self.send((ROOT/'public'/route[1:]).read_bytes(),200,'text/javascript; charset=utf-8' if route.endswith('.js') else 'text/css; charset=utf-8')
   if route=='/manifest.json': return self.send((ROOT/'public/manifest.json').read_bytes(),200,'application/manifest+json')
   if route=='/api/health': return self.send({'ok':True,'mode':'DEMO','payments_real':False})
   if route.startswith('/api/qr/'):
@@ -143,8 +146,9 @@ class Handler(BaseHTTPRequestHandler):
     need(u['role']=='admin','Solo administrador',403)
     return self.send({'items':[dict(x) for x in c.execute('SELECT r.reference,r.amount,r.note,r.created,a.name,a.email,actor.name AS actor_name FROM admin_recharges r JOIN accounts a ON a.id=r.account_id JOIN accounts actor ON actor.id=r.actor_id ORDER BY r.id DESC LIMIT 100')]})
    if route=='/api/dashboard':
-    need(u['role'] in ('admin','operator'),'Sin permiso',403)
-    return self.send({'users':c.execute("SELECT count(*) FROM accounts WHERE role='user'").fetchone()[0],'stores':c.execute('SELECT count(*) FROM stores').fetchone()[0],'recharges':c.execute("SELECT coalesce(sum(delta),0) FROM movements WHERE kind='recarga-demo'").fetchone()[0],'qr_paid':c.execute("SELECT count(*) FROM charges WHERE state='paid'").fetchone()[0]})
+    days=int(parse_qs(urlparse(self.path).query).get('days',['30'])[0])
+    need(days in (7,30,90),'Período inválido: selecciona 7, 30 o 90 días')
+    return self.send(build_dashboard(c,u,days))
   raise APIError('Ruta inexistente',404)
  def post(self):
   route=urlparse(self.path).path

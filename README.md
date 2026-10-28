@@ -57,3 +57,14 @@ SQLite es temporal sin un disco persistente: los datos de prueba pueden perderse
 - Las tablas nuevas se crean sin borrar las existentes. Sigue aplicando la limitación del almacenamiento temporal de Render.
 
 Pruebas locales: `python -m unittest discover -s tests -v`. Usan una base temporal y claves aleatorias de prueba; no consultan cuentas del despliegue.
+
+## Dashboards por perfil
+
+Inicio muestra seis indicadores, una gráfica diaria, distribución de operaciones, ranking y actividad reciente. Permite filtrar 7, 30 o 90 días, actualizar manualmente y consultar los valores diarios en tabla. Se actualiza cada 30 segundos cuando Inicio está visible. No utiliza servicios de gráficas externos.
+
+- Administrador: usuarios, comercios activos, recargas, consumos, pagos QR, usuarios nuevos y próximos eventos.
+- Operador: actividad general, seguimiento de usuarios y operaciones; no recibe los eventos administrativos.
+- Comercio: ventas QR y de productos de sus establecimientos, solicitudes pendientes, catálogo, inventario y productos más vendidos.
+- Usuario: su saldo, recargas, consumos, compras, pagos y comercios donde ha utilizado puntos.
+
+Los indicadores de saldo y catálogo son actuales; las operaciones se filtran por el período indicado, usando días de Bogotá. Los saldos iniciales no se representan como recargas. No se inventan movimientos para completar las gráficas. Los endpoints calculan el alcance a partir de la sesión, sin aceptar IDs ajenos como filtros.
