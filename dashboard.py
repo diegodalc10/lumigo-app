@@ -2,16 +2,18 @@
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 import time
+from records import view_cutoff
 
 BOGOTA = timezone(timedelta(hours=-5))
 
 
 def build_dashboard(c, user, days=30, now=None):
-    now = int(time.time()) if now is None else now
+    now = time.time() if now is None else now
     today = datetime.fromtimestamp(now, BOGOTA).date()
     first = today - timedelta(days=days-1)
     cutoff = int(datetime.combine(first, datetime.min.time(), BOGOTA).timestamp())
     role = user['role']
+    if role in ('user','merchant'): cutoff=max(cutoff,view_cutoff(c,user))
     staff = role in ('admin', 'operator')
     uid = user['id']
     merchant = role == 'merchant'
@@ -26,7 +28,7 @@ def build_dashboard(c, user, days=30, now=None):
     charge_scope, charge_args = ('', ()) if staff else (' AND s.owner=?', (uid,)) if merchant else (' AND q.payer=?', (uid,))
     charges = rows('SELECT q.*,s.name AS store_name FROM charges q JOIN stores s ON s.id=q.store_id WHERE q.created BETWEEN ? AND ?'+charge_scope, (cutoff, now, *charge_args))
     purchase_scope, purchase_args = ('', ()) if staff else (' AND s.owner=?', (uid,)) if merchant else (' AND p.account_id=?', (uid,))
-    purchases = rows('SELECT p.*,s.name AS store_name,pr.name AS product_name,a.name AS person FROM purchases p JOIN stores s ON s.id=p.store_id JOIN products pr ON pr.id=p.product_id JOIN accounts a ON a.id=p.account_id WHERE p.created BETWEEN ? AND ?'+purchase_scope, (cutoff, now, *purchase_args))
+    purchases = rows('SELECT p.id,p.account_id,p.store_id,p.product_id,p.amount,p.created,coalesce(p.store_name,s.name) AS store_name,coalesce(p.product_name,pr.name) AS product_name,a.name AS person FROM purchases p JOIN stores s ON s.id=p.store_id JOIN products pr ON pr.id=p.product_id JOIN accounts a ON a.id=p.account_id WHERE p.created BETWEEN ? AND ?'+purchase_scope, (cutoff, now, *purchase_args))
     series = {str(first+timedelta(days=i)): [0, 0] for i in range(days)}
     def add(ts, index, amount):
         key = str(datetime.fromtimestamp(ts, BOGOTA).date())
