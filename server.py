@@ -196,6 +196,19 @@ class Handler(BaseHTTPRequestHandler):
     name=str(b.get('name','')).strip();price=b.get('price');stock=b.get('stock')
     need(2<=len(name)<=80 and type(price)==int and 100<=price<=10000000 and type(stock)==int and 0<=stock<=100000,'Producto inválido')
     c.execute('INSERT INTO products(store_id,name,price,stock) VALUES(?,?,?,?)',(s['id'],name,price,stock));return self.send({'ok':True})
+   if route=='/api/admin-create-store':
+    need(u['role']=='admin','Solo administrador',403)
+    name=b.get('name'); owner_name=b.get('owner_name'); email=b.get('email'); password=b.get('password')
+    need(all(isinstance(v,str) for v in (name,owner_name,email,password)),'Completa los datos del establecimiento')
+    name=name.strip(); owner_name=owner_name.strip(); email=email.strip().lower()
+    need(2<=len(name)<=80 and 2<=len(owner_name)<=80,'Nombre del establecimiento y responsable: entre 2 y 80 caracteres')
+    need(len(email)<=150 and email.count('@')==1 and all(email.split('@')) and not any(ch.isspace() for ch in email),'Correo inválido')
+    need(12<=len(password)<=256,'La contraseña debe tener entre 12 y 256 caracteres')
+    need(not c.execute('SELECT 1 FROM accounts WHERE email=?',(email,)).fetchone(),'Este correo ya está registrado; usa un correo nuevo para el comercio',409)
+    owner=c.execute('INSERT INTO accounts(name,email,passhash,role,points,created) VALUES(?,?,?,?,0,?)',(owner_name,email,pwd(password),'merchant',int(time.time()))).lastrowid
+    store_id=c.execute('INSERT INTO stores(name,owner,active) VALUES(?,?,1)',(name,owner)).lastrowid
+    c.commit()
+    return self.send({'ok':True,'store':{'id':store_id,'name':name,'active':1},'email':email},201)
    if route=='/api/admin-store':
     need(u['role']=='admin','Solo administrador',403)
     store_id=b.get('store_id'); active=b.get('active')
