@@ -16,11 +16,6 @@ La base de datos `lumigo.sqlite3` se crea al iniciar y preserva usuarios, cobros
 
 | Perfil | Correo | Contraseña |
 |---|---|---|
-| Usuario | usuario@lumigo.demo | Usuario123! |
-| Usuario | carlos@lumigo.demo | Usuario123! |
-| Comercio | comercio@lumigo.demo | Comercio123! |
-| Operador | operador@lumigo.demo | Operador123! |
-| Administrador | admin@lumigo.demo | Admin123! |
 
 ## Flujo para probar el QR
 
@@ -45,8 +40,10 @@ La cámara en navegador requiere **HTTPS o localhost** y compatibilidad con `Bar
 
 ## Preparación para pruebas por Internet (octubre de 2026)
 
-Esta entrega **no está desplegada**. El servidor incluye un bloqueo para evitar publicar accidentalmente las credenciales conocidas de la demo: al ejecutarse con `HOST=0.0.0.0`, exige `LUMIGO_DEMO_ACCESS_KEY` de al menos 24 caracteres. Para usarlo en un dominio público falta implementar una pantalla de acceso a ese entorno privado o un gateway de autenticación en el hosting; **no publiques el ZIP tal cual**.
+Configuración de pruebas privadas en Render: Python, build `pip install -r requirements.txt`, start `python server.py`, HOST=0.0.0.0. Render proporciona PORT. Health check: /api/health.
 
-Para un despliegue con Render se requiere primero subir el proyecto a un repositorio Git, configurar un servicio web Python, un almacenamiento persistente, HTTPS, credenciales no públicas y controles de acceso. La base SQLite en el filesystem efímero de instancias gratuitas puede perder datos al reiniciarse; usar un almacenamiento persistente o migrar a PostgreSQL.
+Configura LUMIGO_GATE_USER y LUMIGO_GATE_PASSWORD (mínimo 24 caracteres) como variables privadas. Nunca incluyas sus valores en Git. La puerta protege la interfaz y las API salvo el health check, que solo informa modo DEMO.
 
-La API `/api/health` responde sin sesión para comprobaciones del servidor. Sigue siendo exclusivamente una demo con recargas ficticias, QR de prueba y sin integración bancaria.
+Las cuentas iniciales usan LUMIGO_USER_PASSWORD, LUMIGO_MERCHANT_PASSWORD, LUMIGO_OPERATOR_PASSWORD y LUMIGO_ADMIN_PASSWORD. Si faltan, se generan claves aleatorias que no se muestran. Configura estas variables antes del primer arranque si necesitas acceder a esos roles. Cambiarlas no modifica cuentas ya creadas. Los usuarios también pueden registrarse después de superar la puerta privada.
+
+SQLite es temporal sin un disco persistente: los datos de prueba pueden perderse con reinicios o despliegues. No introduzcas datos personales reales. Recargas, compras y pagos QR solo modifican puntos locales; no hay integraciones de dinero real ni transferencias bancarias.

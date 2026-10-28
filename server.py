@@ -11,7 +11,8 @@ PORT=int(os.environ.get('PORT','8080'))
 HOST=os.environ.get('HOST','127.0.0.1')
 # This application is a demonstration: publicly accessible deployments must
 # be gated by an explicitly configured private access key.
-DEMO_ACCESS_KEY=os.environ.get('LUMIGO_DEMO_ACCESS_KEY','')
+GATE_USER=os.environ.get('LUMIGO_GATE_USER','')
+GATE_PASSWORD=os.environ.get('LUMIGO_GATE_PASSWORD','')
 
 def connect():
  c=sqlite3.connect(DB,timeout=10); c.row_factory=sqlite3.Row; c.execute('PRAGMA foreign_keys=ON'); c.execute('PRAGMA journal_mode=WAL'); return c
@@ -36,7 +37,7 @@ def init():
   CREATE TABLE IF NOT EXISTS purchases(id INTEGER PRIMARY KEY,account_id INTEGER NOT NULL,store_id INTEGER NOT NULL,product_id INTEGER NOT NULL,amount INTEGER NOT NULL,created INTEGER NOT NULL);
   ''')
   if not c.execute('SELECT 1 FROM accounts LIMIT 1').fetchone():
-   demo=[('Valentina Gómez','usuario@lumigo.demo','Usuario123!','user',45000),('Carlos Rojas','carlos@lumigo.demo','Usuario123!','user',12500),('Comercio Café Andino','comercio@lumigo.demo','Comercio123!','merchant',0),('LumiGo Operador','operador@lumigo.demo','Operador123!','operator',0),('LumiGo Administrador','admin@lumigo.demo','Admin123!','admin',0)]
+   demo=[('Valentina Gómez','usuario@lumigo.demo',os.environ.get('LUMIGO_USER_PASSWORD') or secrets.token_urlsafe(32),'user',45000),('Carlos Rojas','carlos@lumigo.demo',os.environ.get('LUMIGO_USER_PASSWORD') or secrets.token_urlsafe(32),'user',12500),('Comercio Café Andino','comercio@lumigo.demo',os.environ.get('LUMIGO_MERCHANT_PASSWORD') or secrets.token_urlsafe(32),'merchant',0),('LumiGo Operador','operador@lumigo.demo',os.environ.get('LUMIGO_OPERATOR_PASSWORD') or secrets.token_urlsafe(32),'operator',0),('LumiGo Administrador','admin@lumigo.demo',os.environ.get('LUMIGO_ADMIN_PASSWORD') or secrets.token_urlsafe(32),'admin',0)]
    for name,email,password,role,points in demo: c.execute('INSERT INTO accounts(name,email,passhash,role,points,created) VALUES(?,?,?,?,?,?)',(name,email,pwd(password),role,points,int(time.time())))
    owner=c.execute("SELECT id FROM accounts WHERE email='comercio@lumigo.demo'").fetchone()[0]
    c.execute('INSERT INTO stores(name,owner) VALUES(?,?)',('Café Andino',owner)); sid=c.execute('SELECT last_insert_rowid()').fetchone()[0]
@@ -50,14 +51,36 @@ def need(cond,msg,code=400):
 
 class Handler(BaseHTTPRequestHandler):
  def authorized_demo(self):
-  if HOST in ('127.0.0.1','localhost','::1'): return True
-  # Browser sends demo key in request header; health remains accessible to the host.
-  if self.path.startswith('/api/health'): return True
-  return bool(DEMO_ACCESS_KEY) and hmac.compare_digest(self.headers.get('X-LumiGo-Demo-Key',''),DEMO_ACCESS_KEY)
+  # HTTPS-enabled private test deployment. Browser's Basic Auth challenge
+  # blocks all application routes before demo accounts are accessible.
+  if urlparse(self.path).path == '/api/health': return True
+  cookie_name='lumigo_demo_gate'
+  cookie=self.headers.get('Cookie','')
+  expected=hmac.new(GATE_PASSWORD.encode(),b'lumigo-private-gate-v1',hashlib.sha256).hexdigest()
+  for item in cookie.split(';'):
+   name, _, value=item.strip().partition('=')
+   if name==cookie_name and hmac.compare_digest(value,expected): return True
+  auth=self.headers.get('Authorization','')
+  if not auth.startswith('Basic '): return False
+  try:
+   raw=base64.b64decode(auth[6:],validate=True).decode('utf-8')
+   username, password=raw.split(':',1)
+   valid=hmac.compare_digest(username,GATE_USER) and hmac.compare_digest(password,GATE_PASSWORD)
+   if valid: self._issue_demo_cookie=expected
+   return valid
+  except (ValueError,UnicodeError): return False
+ def deny_gate(self):
+  self.send_response(401)
+  self.send_header('WWW-Authenticate','Basic realm="LumiGo demo privado", charset="UTF-8"')
+  self.send_header('Cache-Control','no-store')
+  self.send_header('Content-Length','0')
+  self.end_headers()
  def log_message(self, fmt,*args): print('%s %s'%(self.address_string(),fmt%args))
  def send(self,obj,status=200,ctype='application/json; charset=utf-8'):
   data=json.dumps(obj,ensure_ascii=False).encode() if ctype.startswith('application/json') else obj
-  self.send_response(status); self.send_header('Content-Type',ctype); self.send_header('Content-Length',str(len(data))); self.send_header('Cache-Control','no-store'); self.send_header('X-Content-Type-Options','nosniff'); self.send_header('X-Frame-Options','DENY'); self.end_headers(); self.wfile.write(data)
+  self.send_response(status)
+  if getattr(self,'_issue_demo_cookie',None): self.send_header('Set-Cookie','lumigo_demo_gate='+self._issue_demo_cookie+'; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=28800')
+  self.send_header('Content-Type',ctype); self.send_header('Content-Length',str(len(data))); self.send_header('Cache-Control','no-store'); self.send_header('X-Content-Type-Options','nosniff'); self.send_header('X-Frame-Options','DENY'); self.end_headers(); self.wfile.write(data)
  def body(self):
   n=int(self.headers.get('Content-Length','0')); need(0<n<=20000,'Solicitud inválida')
   try: val=json.loads(self.rfile.read(n)); need(isinstance(val,dict),'Objeto JSON requerido'); return val
@@ -73,10 +96,10 @@ class Handler(BaseHTTPRequestHandler):
   except APIError as e: self.send({'error':e.msg},e.code)
   except (sqlite3.Error,ValueError,TypeError) as e: self.send({'error':'No se pudo procesar la solicitud'},400)
  def do_GET(self):
-  if not self.authorized_demo(): return self.send({'error':'Acceso de pruebas restringido'},403)
+  if not self.authorized_demo(): return self.deny_gate()
   self.response(self.get)
  def do_POST(self):
-  if not self.authorized_demo(): return self.send({'error':'Acceso de pruebas restringido'},403)
+  if not self.authorized_demo(): return self.deny_gate()
   self.response(self.post)
  def get(self):
   route=urlparse(self.path).path
@@ -182,7 +205,8 @@ class Handler(BaseHTTPRequestHandler):
   raise APIError('Ruta inexistente',404)
 
 if __name__=='__main__':
- init();print(f'LumiGo DEMO: http://localhost:{PORT} (NO apta para producción)',flush=True)
- if HOST not in ('127.0.0.1','localhost','::1') and len(DEMO_ACCESS_KEY)<24:
-  raise SystemExit('Para exponer la demo configura LUMIGO_DEMO_ACCESS_KEY (mínimo 24 caracteres).')
+ if not GATE_USER or len(GATE_PASSWORD)<24:
+  raise SystemExit('Configura LUMIGO_GATE_USER y LUMIGO_GATE_PASSWORD (min. 24 caracteres) antes de exponer la demo.')
+ init()
+ print('LumiGo DEMO privado: operaciones simuladas',flush=True)
  ThreadingHTTPServer((HOST,PORT),Handler).serve_forever()
